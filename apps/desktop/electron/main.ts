@@ -11953,13 +11953,6 @@ function touchPoolBackend(profile, options: { activeTurn?: boolean } = {}) {
 
       if (typeof options.activeTurn === 'boolean') {
         entry.activeTurn = options.activeTurn
-
-        // A prompt turn leasing this backend IS streamed activity (#105239):
-        // the keepalive touch alone only proves the chat is open, so the
-        // pinned-tier TTL reads this stamp, not lastActiveAt.
-        if (options.activeTurn) {
-          entry.lastStreamedAt = Date.now()
-        }
       }
 
       return
