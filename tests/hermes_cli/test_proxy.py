@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import json
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +30,32 @@ from hermes_cli.proxy.cli import cmd_proxy_start
 
 def test_adapter_registry_includes_openai_codex():
     assert "openai-codex" in ADAPTERS
+
+
+def test_adapter_registry_imports_without_openai_sdk():
+    script = """
+import importlib.abc
+import sys
+
+class _BlockOpenAI(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "openai" or fullname.startswith("openai."):
+            raise ModuleNotFoundError("blocked for test", name=fullname)
+        return None
+
+sys.meta_path.insert(0, _BlockOpenAI())
+import hermes_cli.proxy.adapters
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_openai_codex_adapter_translates_nonstreaming_chat_completion(monkeypatch):
@@ -112,6 +141,68 @@ def test_openai_codex_adapter_does_not_expose_credential_errors(monkeypatch):
     assert result is not None
     assert result.status == 502
     assert "secret bearer value" not in result.body.decode()
+
+
+def test_openai_codex_adapter_sanitizes_missing_openai_sdk(monkeypatch):
+    real_import = builtins.__import__
+
+    def _block_openai(name, *args, **kwargs):
+        if name == "openai" or name.startswith("openai."):
+            raise ModuleNotFoundError("blocked for test", name=name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _block_openai)
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.resolve_provider_client",
+        lambda provider, model: (_ for _ in ()).throw(AssertionError("must not resolve without SDK")),
+    )
+
+    result = OpenAICodexAdapter().handle_local_request(
+        "/chat/completions",
+        json.dumps({"model": "gpt-5.6-luna", "messages": []}).encode(),
+    )
+
+    assert result is not None
+    assert result.status == 502
+    assert json.loads(result.body)["error"]["code"] == "codex_inference_failed"
+
+
+def test_openai_codex_adapter_does_not_sanitize_unrelated_import_errors(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.resolve_provider_client",
+        lambda provider, model: (_ for _ in ()).throw(
+            ModuleNotFoundError("unrelated dependency missing", name="unrelated_dependency")
+        ),
+    )
+
+    with pytest.raises(ModuleNotFoundError, match="unrelated dependency missing"):
+        OpenAICodexAdapter().handle_local_request(
+            "/chat/completions",
+            json.dumps({"model": "gpt-5.6-luna", "messages": []}).encode(),
+        )
+
+
+def test_openai_codex_adapter_does_not_swallow_programming_errors(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.resolve_provider_client",
+        lambda provider, model: (_ for _ in ()).throw(AssertionError("programming defect")),
+    )
+
+    with pytest.raises(AssertionError, match="programming defect"):
+        OpenAICodexAdapter().handle_local_request(
+            "/chat/completions",
+            json.dumps({"model": "gpt-5.6-luna", "messages": []}).encode(),
+        )
+
+
+def test_openai_codex_adapter_pool_load_does_not_swallow_programming_errors(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.load_pool",
+        lambda provider: (_ for _ in ()).throw(AssertionError("programming defect")),
+    )
+
+    with pytest.raises(AssertionError, match="programming defect"):
+        OpenAICodexAdapter().is_authenticated()
 
 
 def test_openai_codex_adapter_rejects_streaming_requests(monkeypatch):
@@ -503,6 +594,26 @@ def test_server_uses_adapter_local_translation_before_upstream_credentials():
                         "translated": "gpt-5.6-luna",
                         "path": "/chat/completions",
                     }
+            assert adapter.calls == 0
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_server_does_not_convert_local_adapter_programming_errors():
+    class _BuggyLocalAdapter(FakeAdapter):
+        def handle_local_request(self, rel_path, body):
+            raise AssertionError("programming defect")
+
+    async def scenario():
+        adapter = _BuggyLocalAdapter("https://must-not-be-called.invalid/v1")
+        runner, base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{base}/v1/chat/completions", json={}) as response:
+                    assert response.status == 500
+                    assert "adapter_translation_failed" not in await response.text()
             assert adapter.calls == 0
         finally:
             await runner.cleanup()

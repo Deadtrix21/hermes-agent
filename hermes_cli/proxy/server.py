@@ -278,11 +278,7 @@ def create_app(
         # Body read into memory once (chat/embeddings payloads are small); switch to streaming
         # if large multipart uploads ever need forwarding.
         body = await request.read()
-        try:
-            local_response = await asyncio.to_thread(adapter.handle_local_request, rel_path, body)
-        except Exception as exc:
-            logger.warning("proxy: local adapter translation failed: %s", type(exc).__name__)
-            return _json_error(500, "local adapter translation failed", code="adapter_translation_failed")
+        local_response = await asyncio.to_thread(adapter.handle_local_request, rel_path, body)
         if local_response is not None:
             return web.Response(
                 status=local_response.status,

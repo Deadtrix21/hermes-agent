@@ -104,19 +104,31 @@ class OpenAICodexAdapter(UpstreamAdapter):
         kwargs.pop("stream", None)
         client = None
         try:
+            from openai import APIError
+
             client, resolved_model = resolve_provider_client(_POOL_PROVIDER, model)
             if client is None:
                 raise RuntimeError("OpenAI Codex OAuth credentials are unavailable.")
             kwargs["model"] = resolved_model or model
             response = client.chat.completions.create(**kwargs)
             return LocalAdapterResponse(status=200, body=self._response_bytes(response))
-        except Exception as exc:
-            logger.warning("Codex proxy inference failed: %s", type(exc).__name__)
-            return self._json_error(502, "Codex inference failed.", "codex_inference_failed")
+        except ImportError as exc:
+            missing_module = str(exc.name or "")
+            if missing_module != "openai" and not missing_module.startswith("openai."):
+                raise
+            return self._inference_error(exc)
+        except APIError as exc:
+            return self._inference_error(exc)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return self._inference_error(exc)
         finally:
             close = getattr(client, "close", None)
             if callable(close):
                 close()
+
+    def _inference_error(self, exc: BaseException) -> LocalAdapterResponse:
+        logger.warning("Codex proxy inference failed: %s", type(exc).__name__)
+        return self._json_error(502, "Codex inference failed.", "codex_inference_failed")
 
     @staticmethod
     def _response_bytes(response) -> bytes:
@@ -155,7 +167,8 @@ class OpenAICodexAdapter(UpstreamAdapter):
     def _load_pool(self) -> Optional[CredentialPool]:
         try:
             return load_pool(_POOL_PROVIDER)
-        except Exception:
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.debug("Codex credential pool load failed: %s", type(exc).__name__)
             return None
 
     @staticmethod
